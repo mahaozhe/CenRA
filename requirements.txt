@@ -1,0 +1,9 @@
+numpy==1.23.5
+gymnasium==0.28.1
+minigrid==2.3.1
+miniworld==2.0.0
+safety-gymnasium
+mujoco==2.3.3
+stable-baselines3==2.1.0
+tensorboard
+matplotlib
