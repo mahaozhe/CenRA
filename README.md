@@ -2,7 +2,7 @@
 
 The codes for the **Cen**tralized **R**eward **A**gent (CenRA) framework of MTRL. 
 
-[[Paper link]()]
+[[Paper link](https://arxiv.org/pdf/2408.10858)]
 
 CenRA consists of two components: one centralized reward agent (CRA) and multiple distributed policy agents for their corresponding tasks. The CRA is responsible for learning a reward model to share and transfer task-relevant knowledge to the policy agents. 
 
