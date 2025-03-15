@@ -69,6 +69,9 @@ def parse_args():
     parser.add_argument("--pa-learning-starts", type=int, default=1e4)
     parser.add_argument("--ra-learning-starts", type=int, default=5e3)
 
+    # ! new for steps of sampling control
+    parser.add_argument("--weights-steps", type=int, default=100)
+
     args = parser.parse_args()
     return args
 
@@ -97,7 +100,8 @@ def run():
                  batch_size=args.pa_batch_size, policy_lr=args.pa_actor_lr, q_lr=args.pa_critic_lr,
                  alpha_lr=args.pa_alpha_lr, target_network_frequency=args.pa_target_frequency, tau=args.pa_tau,
                  policy_frequency=args.pa_policy_frequency, alpha=args.pa_alpha, alpha_autotune=args.pa_alpha_autotune,
-                 write_frequency=100, save_folder=f"{args.save_folder}/{env_names[e]}") for e in range(len(envs))]
+                 weights_steps=args.weights_steps, write_frequency=100,
+                 save_folder=f"{args.save_folder}/{env_names[e]}") for e in range(len(envs))]
 
     agent = CenRA_con(policy_agents=policy_agents, sample_env=envs[0], actor_class=RAActorVectorObs,
                       critic_class=RAQNetVectorObs, buffer_size=args.ra_buffer_size * len(envs),

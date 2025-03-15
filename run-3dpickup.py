@@ -58,6 +58,9 @@ def parse_args():
     parser.add_argument("--pa-learning-starts", type=int, default=1e4)
     parser.add_argument("--ra-learning-starts", type=int, default=5e3)
 
+    # ! new for steps of sampling control
+    parser.add_argument("--weights-steps", type=int, default=100)
+
     args = parser.parse_args()
     return args
 
@@ -79,7 +82,8 @@ def run():
                  seed=args.seed, cuda=args.cuda, learning_rate=args.pa_learning_rate, buffer_size=args.pa_buffer_size,
                  rb_optimize_memory=args.pa_rb_optimize_memory, gamma=0.99, tau=1.0, target_network_frequency=500,
                  batch_size=args.pa_batch_size, start_e=1.0, end_e=0.05, exploration_fraction=1.0, train_frequency=10,
-                 write_frequency=100, save_folder=f"{args.save_folder}/{env.unwrapped.spec.id}") for env in envs]
+                 weights_steps=args.weights_steps, write_frequency=100,
+                 save_folder=f"{args.save_folder}/{env.unwrapped.spec.id}") for env in envs]
 
     agent = CenRA_dis(policy_agents=policy_agents, sample_env=envs[0], actor_class=RAActorWorld,
                       critic_class=RAQNetMiniWorld, buffer_size=args.pa_buffer_size * len(env_ids),
