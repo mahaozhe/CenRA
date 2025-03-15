@@ -5,19 +5,16 @@ The script for the Centralized Reward Agent.
 import gymnasium as gym
 
 import numpy as np
+import math
 
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
 
-from torch.utils.tensorboard import SummaryWriter
-
-from stable_baselines3.common.buffers import DictReplayBuffer, ReplayBuffer
+from CenRA.utils import CenRAReplayBufferSamples
 
 import os
 import random
-import datetime
-import time
 
 
 class CenRA_dis:
@@ -82,15 +79,16 @@ class CenRA_dis:
             'action': sample_env.action_space
         })
 
+        # ! no need the replay buffer
         # initialize the replay buffer
-        self.replay_buffer = DictReplayBuffer(
-            buffer_size,
-            self.ra_obs_space,
-            self.suggested_reward_space,
-            self.device,
-            optimize_memory_usage=rb_optimize_memory,
-            handle_timeout_termination=False,
-        )
+        # self.replay_buffer = DictReplayBuffer(
+        #     buffer_size,
+        #     self.ra_obs_space,
+        #     self.suggested_reward_space,
+        #     self.device,
+        #     optimize_memory_usage=rb_optimize_memory,
+        #     handle_timeout_termination=False,
+        # )
 
         # initialize the actor and critic networks for the Reward Agent
         self.actor = actor_class(self.ra_obs_space, self.suggested_reward_space).to(self.device)
@@ -150,8 +148,15 @@ class CenRA_dis:
                 next_obs, next_action, reward_env, done, info = self.policy_agents[p].step(
                     obs_ra_dict[p]['observation'], obs_ra_dict[p]['action'], total_timesteps, global_step)
                 next_obs_ra_dict_one = {'observation': next_obs, 'action': next_action}
+
+                # ! call the policy agent to add the transition to its replay buffer
+                # * the PA's replay buffer stores <s, next_s, a, next_a, env_r, cen_r, done, infos>
+                self.policy_agents[p].replay_buffer.add(obs_ra_dict[p]['observation'], next_obs,
+                                                        obs_ra_dict[p]['action'], next_action,
+                                                        reward_env, reward_sug[p][0], done, info)
+
                 # store the transition to the RA replay buffer
-                self.replay_buffer.add(obs_ra_dict[p], next_obs_ra_dict_one, reward_sug[p][0], reward_env, done, info)
+                # self.replay_buffer.add(obs_ra_dict[p], next_obs_ra_dict_one, reward_sug[p][0], reward_env, done, info)
 
                 if done:
                     # if the specific environment is done, reset it
@@ -169,21 +174,44 @@ class CenRA_dis:
                 self.optimize(global_step)
 
     def optimize(self, global_step):
-        data = self.replay_buffer.sample(self.batch_size)
+        # ! sample from the replay buffer of the policy agents based on a given allocation
+        # get the two weights from the policy agents
+        tail_returns = np.array([sum(pa.past_returns) for pa in self.policy_agents])
+        tail_features = np.array([np.mean(np.array(pa.past_features), axis=0) for pa in self.policy_agents])
+
+        # calculate the return weights: weights = softmax(1 / tail_returns)
+        return_weights = np.exp(1 / tail_returns) / np.sum(np.exp(1 / tail_returns))
+        # calculate the feature weights: weights = softmax(1 / sim_i), sim_i = c dot f_i / sqrt(dim(c)), c = mean(f)
+        center_feature = np.mean(tail_features, axis=0)
+        feature_sim = center_feature @ tail_features.T / math.sqrt(len(center_feature))
+        feature_weights = np.exp(1 / feature_sim) / np.sum(np.exp(1 / feature_sim))
+
+        weights = 0.5 * (return_weights + feature_weights)
+
+        pa_batch_size = (self.batch_size * weights).astype(int)
+        # sample from the replay buffer of the policy agents, based on the given allocation
+        data_pa = [pa.replay_buffer.sample(batch_size) for pa, batch_size in zip(self.policy_agents, pa_batch_size)]
+        # merge all data to a single batch
+        data = CenRAReplayBufferSamples(
+            observations=torch.cat([d.observations for d in data_pa], dim=0),
+            actions=torch.cat([d.actions for d in data_pa], dim=0),
+            next_observations=torch.cat([d.next_observations for d in data_pa], dim=0),
+            dones=torch.cat([d.dones for d in data_pa], dim=0),
+            rewards=torch.cat([d.rewards for d in data_pa], dim=0),
+            next_actions=torch.cat([d.next_actions for d in data_pa], dim=0),
+            shaped_rewards=torch.cat([d.shaped_rewards for d in data_pa], dim=0)
+        )
 
         with torch.no_grad():
-            next_state_actions, next_state_log_pi, _ = self.actor.get_action(data.next_observations['observation'],
-                                                                             data.next_observations['action'])
-            qf_1_next_target = self.qf_1_target(data.next_observations['observation'], data.next_observations['action'],
-                                                next_state_actions)
-            qf_2_next_target = self.qf_2_target(data.next_observations['observation'], data.next_observations['action'],
-                                                next_state_actions)
+            next_shaped_reward, next_state_log_pi, _ = self.actor.get_action(data.next_observations, data.next_actions)
+            qf_1_next_target = self.qf_1_target(data.next_observations, data.next_actions, next_shaped_reward)
+            qf_2_next_target = self.qf_2_target(data.next_observations, data.next_actions, next_shaped_reward)
             min_qf_next_target = torch.min(qf_1_next_target, qf_2_next_target) - self.alpha * next_state_log_pi
             next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * self.gamma * min_qf_next_target.view(
                 -1)
 
-        qf_1_a_values = self.qf_1(data.observations['observation'], data.observations['action'], data.actions).view(-1)
-        qf_2_a_values = self.qf_2(data.observations['observation'], data.observations['action'], data.actions).view(-1)
+        qf_1_a_values = self.qf_1(data.observations, data.actions, data.shaped_rewards).view(-1)
+        qf_2_a_values = self.qf_2(data.observations, data.actions, data.shaped_rewards).view(-1)
         qf_1_loss = F.mse_loss(qf_1_a_values, next_q_value)
         qf_2_loss = F.mse_loss(qf_2_a_values, next_q_value)
         qf_loss = qf_1_loss + qf_2_loss
@@ -194,9 +222,9 @@ class CenRA_dis:
 
         if global_step % self.policy_frequency == 0:
             for _ in range(self.policy_frequency):
-                pi, log_pi, _ = self.actor.get_action(data.observations['observation'], data.observations['action'])
-                qf_1_pi = self.qf_1(data.observations['observation'], data.observations['action'], pi)
-                qf_2_pi = self.qf_2(data.observations['observation'], data.observations['action'], pi)
+                pi, log_pi, _ = self.actor.get_action(data.observations, data.actions)
+                qf_1_pi = self.qf_1(data.observations, data.actions, pi)
+                qf_2_pi = self.qf_2(data.observations, data.actions, pi)
                 min_qf_pi = torch.min(qf_1_pi, qf_2_pi)
                 actor_loss = ((self.alpha * log_pi) - min_qf_pi).mean()
 
@@ -206,8 +234,7 @@ class CenRA_dis:
 
                 if self.alpha_autotune:
                     with torch.no_grad():
-                        _, log_pi, _ = self.actor.get_action(data.observations['observation'],
-                                                             data.observations['action'])
+                        _, log_pi, _ = self.actor.get_action(data.observations, data.actions)
                     alpha_loss = (-self.log_alpha.exp() * (log_pi + self.target_entropy)).mean()
 
                     self.alpha_optimizer.zero_grad()
@@ -265,22 +292,11 @@ class CenRA_con(CenRA_dis):
                                                      shape=(1,), dtype=np.float32, seed=seed)
 
         # + create the observation space for the reward agent
-
         self.ra_obs_space = gym.spaces.Box(low=-1, high=1,
                                            shape=(
                                                sample_env.observation_space.shape[0] + sample_env.action_space.shape[
                                                    0],),
                                            dtype=np.float32, seed=seed)
-
-        # initialize the replay buffer
-        self.replay_buffer = ReplayBuffer(
-            buffer_size,
-            self.ra_obs_space,
-            self.suggested_reward_space,
-            self.device,
-            optimize_memory_usage=rb_optimize_memory,
-            handle_timeout_termination=False,
-        )
 
         # initialize the actor and critic networks for the Reward Agent
         self.actor = actor_class(self.ra_obs_space, self.suggested_reward_space).to(self.device)
@@ -341,9 +357,16 @@ class CenRA_con(CenRA_dis):
                 next_obs, next_action, reward_env, done, info = self.policy_agents[p].step(
                     obs_ra_dict[p]['observation'], obs_ra_dict[p]['action'], pa_learning_starts, global_step)
                 next_obs_ra_dict_one = {'observation': next_obs, 'action': next_action}
+
                 # store the transition to the RA replay buffer
-                self.replay_buffer.add(obs_ra_list[p], np.hstack((next_obs, next_action)), reward_sug[p][0], reward_env,
-                                       done, info)
+                # self.replay_buffer.add(obs_ra_list[p], np.hstack((next_obs, next_action)), reward_sug[p][0], reward_env,
+                #                        done, info)
+
+                # ! call the policy agent to add the transition to its replay buffer
+                # * the PA's replay buffer stores <s, next_s, a, next_a, env_r, cen_r, done, infos>
+                self.policy_agents[p].replay_buffer.add(obs_ra_dict[p]['observation'], next_obs,
+                                                        obs_ra_dict[p]['action'], next_action,
+                                                        reward_env, reward_sug[p][0], done, info)
 
                 if done:
                     # if the specific environment is done, reset it
@@ -361,18 +384,42 @@ class CenRA_con(CenRA_dis):
                 self.optimize(global_step)
 
     def optimize(self, global_step):
-        data = self.replay_buffer.sample(self.batch_size)
+        tail_returns = np.array([sum(pa.past_returns) for pa in self.policy_agents])
+        tail_features = np.array([np.mean(np.array(pa.past_features), axis=0) for pa in self.policy_agents])
+
+        return_weights = np.exp(1 / tail_returns) / np.sum(np.exp(1 / tail_returns))
+        center_feature = np.mean(tail_features, axis=0)
+        feature_sim = center_feature @ tail_features.T / math.sqrt(len(center_feature))
+        feature_weights = np.exp(1 / feature_sim) / np.sum(np.exp(1 / feature_sim))
+
+        weights = 0.5 * (return_weights + feature_weights)
+
+        pa_batch_size = (self.batch_size * weights).astype(int)
+        data_pa = [pa.replay_buffer.sample(batch_size) for pa, batch_size in zip(self.policy_agents, pa_batch_size)]
+        data = CenRAReplayBufferSamples(
+            observations=torch.cat([d.observations for d in data_pa], dim=0),
+            actions=torch.cat([d.actions for d in data_pa], dim=0),
+            next_observations=torch.cat([d.next_observations for d in data_pa], dim=0),
+            dones=torch.cat([d.dones for d in data_pa], dim=0),
+            rewards=torch.cat([d.rewards for d in data_pa], dim=0),
+            next_actions=torch.cat([d.next_actions for d in data_pa], dim=0),
+            shaped_rewards=torch.cat([d.shaped_rewards for d in data_pa], dim=0)
+        )
 
         with torch.no_grad():
-            next_state_actions, next_state_log_pi, _ = self.actor.get_action(data.next_observations)
-            qf_1_next_target = self.qf_1_target(data.next_observations, next_state_actions)
-            qf_2_next_target = self.qf_2_target(data.next_observations, next_state_actions)
+            # stack the obs and action as obs
+            next_obs_ra = torch.cat([data.next_observations, data.next_actions], dim=1)
+            next_shaped_rewards, next_state_log_pi, _ = self.actor.get_action(next_obs_ra)
+            qf_1_next_target = self.qf_1_target(next_obs_ra, next_shaped_rewards)
+            qf_2_next_target = self.qf_2_target(next_obs_ra, next_shaped_rewards)
             min_qf_next_target = torch.min(qf_1_next_target, qf_2_next_target) - self.alpha * next_state_log_pi
             next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * self.gamma * min_qf_next_target.view(
                 -1)
 
-        qf_1_a_values = self.qf_1(data.observations, data.actions).view(-1)
-        qf_2_a_values = self.qf_2(data.observations, data.actions).view(-1)
+        obs_ra = torch.cat([data.observations, data.actions], dim=1)
+
+        qf_1_a_values = self.qf_1(obs_ra, data.shaped_rewards).view(-1)
+        qf_2_a_values = self.qf_2(obs_ra, data.shaped_rewards).view(-1)
         qf_1_loss = F.mse_loss(qf_1_a_values, next_q_value)
         qf_2_loss = F.mse_loss(qf_2_a_values, next_q_value)
         qf_loss = qf_1_loss + qf_2_loss
@@ -383,9 +430,9 @@ class CenRA_con(CenRA_dis):
 
         if global_step % self.policy_frequency == 0:
             for _ in range(self.policy_frequency):
-                pi, log_pi, _ = self.actor.get_action(data.observations)
-                qf_1_pi = self.qf_1(data.observations, pi)
-                qf_2_pi = self.qf_2(data.observations, pi)
+                pi, log_pi, _ = self.actor.get_action(obs_ra)
+                qf_1_pi = self.qf_1(obs_ra, pi)
+                qf_2_pi = self.qf_2(obs_ra, pi)
                 min_qf_pi = torch.min(qf_1_pi, qf_2_pi)
                 actor_loss = ((self.alpha * log_pi) - min_qf_pi).mean()
 
@@ -395,7 +442,7 @@ class CenRA_con(CenRA_dis):
 
                 if self.alpha_autotune:
                     with torch.no_grad():
-                        _, log_pi, _ = self.actor.get_action(data.observations)
+                        _, log_pi, _ = self.actor.get_action(obs_ra)
                     alpha_loss = (-self.log_alpha.exp() * (log_pi + self.target_entropy)).mean()
 
                     self.alpha_optimizer.zero_grad()

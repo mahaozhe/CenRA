@@ -6,13 +6,15 @@ import gymnasium as gym
 
 import numpy as np
 
+from collections import deque
+
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
 
 from torch.utils.tensorboard import SummaryWriter
 
-from stable_baselines3.common.buffers import ReplayBuffer
+from CenRA.utils import CenRAReplayBuffe as ReplayBuffer
 
 import os
 import random
@@ -28,7 +30,7 @@ class DQNAgent:
     def __init__(self, env, q_network_class, exp_name="CenRA_dqn", seed=1, cuda=0, learning_rate=2.5e-4,
                  buffer_size=10000, rb_optimize_memory=False, gamma=0.99, tau=1., target_network_frequency=500,
                  batch_size=128, start_e=1, end_e=0.05, exploration_fraction=0.5, train_frequency=10,
-                 write_frequency=100, save_folder="./CenRA_dqn/"):
+                 weights_steps=20, write_frequency=100, save_folder="./CenRA_dqn/"):
         """
         Initialize the DQN algorithm.
         :param env: the gymnasium-based environment
@@ -100,6 +102,13 @@ class DQNAgent:
         # for the training
         self.train_frequency = train_frequency
 
+        # + for weights steps
+        self.past_returns = deque([1e-4] * weights_steps, maxlen=weights_steps)
+        # get a dummy feature from the q network
+        dummy_obs = torch.Tensor(np.zeros((1,) + self.env.observation_space.shape)).to(self.device)
+        dummy_feature = self.q_network.get_features(dummy_obs).cpu().detach().numpy()
+        self.past_features = deque([dummy_feature] * weights_steps, maxlen=weights_steps)
+
         # * for the tensorboard writer
         run_name = f"{exp_name}-{seed}-{datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d-%H-%M-%S')}"
         os.makedirs("./runs/", exist_ok=True)
@@ -142,7 +151,7 @@ class DQNAgent:
         next_obs, reward, terminated, truncated, info = self.env.step(action)
         done = terminated or truncated
 
-        self.replay_buffer.add(obs, next_obs, action, reward, done, info)
+        # self.replay_buffer.add(obs, next_obs, action, reward, done, info)
 
         epsilon = self.linear_schedule(self.exploration_fraction * total_timesteps, global_step)
 
@@ -154,6 +163,12 @@ class DQNAgent:
 
         if "episode" in info:
             self.writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
+
+            # * add the past returns
+            self.past_returns.append(info["episode"]["r"]) if info["episode"]["r"] > 0 else self.past_returns.append(
+                1e-4)
+            self.past_features.append(
+                self.q_network.get_features(torch.Tensor(np.expand_dims(obs, axis=0)).to(self.device)))
 
         return next_obs, next_action, reward, done, info
 
@@ -196,7 +211,7 @@ class SACAgent:
     def __init__(self, env, actor_class, critic_class, exp_name="sac", seed=1, cuda=0, gamma=0.99, buffer_size=1000000,
                  rb_optimize_memory=False, batch_size=256, policy_lr=3e-4, q_lr=1e-3, eps=1e-8, alpha_lr=1e-4,
                  target_network_frequency=1, tau=0.005, policy_frequency=2, alpha=0.2, alpha_autotune=True,
-                 write_frequency=100, save_folder="./sac/"):
+                 weights_steps=20, write_frequency=100, save_folder="./sac/"):
         """
         Initialize the SAC algorithm.
         :param env: the gymnasium-based environment
@@ -281,6 +296,11 @@ class SACAgent:
         self.target_network_frequency = target_network_frequency
         self.tau = tau
 
+        # + for weights steps
+        self.past_returns = deque([1e-4] * weights_steps, maxlen=weights_steps)
+        # * the continuous observation can be directly used as the feature
+        self.past_features = deque([np.zeros_like(env.observation_space)] * weights_steps, maxlen=weights_steps)
+
         # * for the tensorboard writer
         run_name = f"{exp_name}-{seed}-{datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d-%H-%M-%S')}"
         os.makedirs("./runs/", exist_ok=True)
@@ -305,7 +325,7 @@ class SACAgent:
         next_obs, reward, terminated, truncated, info = self.env.step(action)
         done = terminated or truncated
 
-        self.replay_buffer.add(obs, next_obs, action, reward, done, info)
+        # self.replay_buffer.add(obs, next_obs, action, reward, done, info)
 
         if global_step < learning_starts:
             next_action = self.env.action_space.sample()
@@ -315,6 +335,10 @@ class SACAgent:
 
         if "episode" in info:
             self.writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
+
+            self.past_returns.append(info["episode"]["r"]) if info["episode"]["r"] > 0 else self.past_returns.append(
+                1e-4)
+            self.past_features.append(obs)
 
         return next_obs, next_action, reward, done, info
 

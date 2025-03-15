@@ -56,6 +56,9 @@ def parse_args():
     parser.add_argument("--pa-learning-starts", type=int, default=1e4)
     parser.add_argument("--ra-learning-starts", type=int, default=5e3)
 
+    # ! new for steps of sampling control
+    parser.add_argument("--weights-steps", type=int, default=100)
+
     args = parser.parse_args()
     return args
 

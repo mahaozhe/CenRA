@@ -50,6 +50,12 @@ class QNetMiniGrid(nn.Module):
         cnn_features = self.cnn(x)
         return self.network(cnn_features)
 
+    def get_features(self, x):
+        # without tracking the gradients
+        with torch.no_grad():
+            cnn_features = self.cnn(x).view(-1)
+        return cnn_features
+
 
 class QNetMiniWorld(nn.Module):
     """
@@ -82,6 +88,12 @@ class QNetMiniWorld(nn.Module):
     def forward(self, x):
         cnn_features = self.cnn(x / 255.0)
         return self.network(cnn_features)
+
+    def get_features(self, x):
+        # without tracking the gradients
+        with torch.no_grad():
+            cnn_features = self.cnn(x / 255.0).view(-1)
+        return cnn_features
 
 
 class VectorActor(nn.Module):
